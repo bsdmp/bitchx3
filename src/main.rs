@@ -155,8 +155,17 @@ impl App {
         }
         // If the line got shorter (deletion) or the window got wider
         // (resize), don't leave a scroll position with unnecessary blank
-        // space trailing past the end of the text.
-        let max_scroll = self.input.len().saturating_sub(width);
+        // space trailing past the end of the text. When the cursor sits
+        // right after the last character (append position), one extra
+        // column must stay reserved for it -- otherwise this clamp pulls
+        // the scroll back and the cursor gets rendered one column past the
+        // visible area, which terminals clip back onto the last character.
+        let effective_len = if self.input_cursor >= self.input.len() {
+            self.input.len() + 1
+        } else {
+            self.input.len()
+        };
+        let max_scroll = effective_len.saturating_sub(width);
         if self.input_scroll > max_scroll {
             self.input_scroll = max_scroll;
         }

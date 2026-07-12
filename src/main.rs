@@ -2,9 +2,7 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    },
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -13,7 +11,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
     Frame, Terminal,
 };
 
@@ -28,7 +26,7 @@ struct App {
     /// you stay at the bottom after a resize; if you'd scrolled up, your
     /// position is preserved (and only clamped if it would go out of range).
     follow_bottom: bool,
-    /// Inner height (in lines) of the output area, refreshed every draw call.
+    /// Height (in lines) of the output area, refreshed every draw call.
     last_output_height: usize,
 }
 
@@ -49,9 +47,7 @@ impl App {
     }
 
     fn max_scroll(&self) -> usize {
-        self.output
-            .len()
-            .saturating_sub(self.last_output_height.max(1))
+        self.output.len().saturating_sub(self.last_output_height.max(1))
     }
 
     /// Re-validate `scroll` against the current output height. Call this
@@ -161,9 +157,9 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(3),    // output area -- takes remaining space
+            Constraint::Min(1),    // output area -- takes remaining space
             Constraint::Length(1), // status bar -- fixed 1 line
-            Constraint::Length(3), // input area -- fixed 3 lines (bordered)
+            Constraint::Length(1), // input area -- fixed 1 line
         ])
         .split(f.area());
 
@@ -173,23 +169,17 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
 }
 
 fn draw_output(f: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title("Output");
-    let inner_height = block.inner(area).height as usize;
+    // No border now, so the full area height is the visible line count.
+    let inner_height = area.height as usize;
 
     // Update the known height *before* clamping, so a resize is honored
     // on this very frame rather than lagging a keypress behind.
     app.last_output_height = inner_height;
     app.clamp_scroll();
 
-    let lines: Vec<Line> = app
-        .output
-        .iter()
-        .map(|s| Line::from(Span::raw(s.clone())))
-        .collect();
+    let lines: Vec<Line> = app.output.iter().map(|s| Line::from(Span::raw(s.clone()))).collect();
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .scroll((app.scroll as u16, 0));
+    let paragraph = Paragraph::new(lines).scroll((app.scroll as u16, 0));
 
     f.render_widget(paragraph, area);
 }
@@ -207,12 +197,13 @@ fn draw_status_bar(f: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_input(f: &mut Frame<'_>, app: &App, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title("Input");
-    let paragraph = Paragraph::new(app.input.as_str()).block(block);
+    // Prefix so it's visually distinguishable from the output area.
+    let text = format!("> {}", app.input);
+    let paragraph = Paragraph::new(text.as_str());
     f.render_widget(paragraph, area);
 
     // Keep the terminal cursor visually parked at the end of typed input.
-    let cursor_x = area.x + 1 + app.input.len() as u16;
-    let cursor_y = area.y + 1;
+    let cursor_x = area.x + 2 + app.input.len() as u16;
+    let cursor_y = area.y;
     f.set_cursor_position((cursor_x, cursor_y));
 }

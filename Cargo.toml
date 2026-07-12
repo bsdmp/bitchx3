@@ -8,3 +8,5 @@ ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
 futures = "0.3"
+tokio-rustls = "0.26.4"
+webpki-roots = "1.0.8"

@@ -1,4 +1,5 @@
 use std::io::{self, Stdout};
+use std::sync::{Arc, OnceLock};
 
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind, KeyModifiers},
@@ -15,9 +16,13 @@ use ratatui::{
     Frame, Terminal,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{split, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpStream,
     sync::mpsc,
+};
+use tokio_rustls::{
+    rustls::{pki_types::ServerName, ClientConfig, RootCertStore},
+    TlsConnector,
 };
 
 /// Holds all mutable application state.
@@ -51,7 +56,7 @@ impl App {
         let output = vec![
             "Welcome! Type a message and press Enter to submit.".to_string(),
             "Use PageUp / PageDown to scroll this output area.".to_string(),
-            "Try /connect irc.libera.chat:6667 to connect to an IRC server.".to_string(),
+            "Try /connect irc.libera.chat:6667, or /connect --tls irc.libera.chat:6697.".to_string(),
         ];
         Self {
             output,
@@ -310,32 +315,109 @@ fn format_irc_line(raw: &str) -> String {
     out.trim().to_string()
 }
 
-/// Turns a user-typed `/connect` argument into a `host:port` string,
-/// defaulting to IRC's traditional plaintext port when none is given.
-fn parse_connect_target(arg: &str) -> String {
-    if arg.contains(':') {
-        arg.to_string()
-    } else {
-        format!("{arg}:6667")
-    }
+/// Any duplex byte stream we can speak the IRC protocol over -- lets
+/// `spawn_connection` treat a plain `TcpStream` and a TLS-wrapped one
+/// identically after the handshake.
+trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
+
+/// Lazily-built, shared TLS client config using Mozilla's bundled root
+/// store (via `webpki-roots`) rather than the OS trust store, so this works
+/// the same in a bare container as on a full desktop. Built once and reused
+/// across connections.
+fn tls_client_config() -> Arc<ClientConfig> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let mut roots = RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let config = ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            Arc::new(config)
+        })
+        .clone()
 }
 
-/// Connects to `target` and relays every line the server sends back through
-/// `out_tx`. Also takes `cmd_rx`, a channel the UI can use to send raw lines
-/// out to the server (e.g. forwarding whatever the user types once
-/// connected). Runs until the connection closes or errors.
-fn spawn_connection(target: String, out_tx: mpsc::UnboundedSender<String>, mut cmd_rx: mpsc::UnboundedReceiver<String>) {
+/// Performs a TLS handshake over an already-connected TCP stream, verifying
+/// the server's certificate against `host` (used as the SNI / hostname to
+/// validate -- not just for the initial DNS lookup).
+async fn upgrade_to_tls(host: &str, tcp: TcpStream) -> io::Result<impl AsyncStream> {
+    let connector = TlsConnector::from(tls_client_config());
+    let server_name = ServerName::try_from(host.to_string())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid hostname {host:?}: {e}")))?;
+    connector.connect(server_name, tcp).await
+}
+
+/// Turns a user-typed `/connect` argument into (host, port, use_tls).
+/// Accepts an optional leading `--tls` (or `-tls`) flag, e.g.
+/// `--tls irc.libera.chat:6697` or plain `irc.libera.chat`. Defaults the
+/// port to IRC's traditional plaintext port (6667), or 6697 when TLS is
+/// requested and no port is given.
+fn parse_connect_args(arg: &str) -> Option<(String, u16, bool)> {
+    let mut rest = arg.trim();
+    let mut tls = false;
+    for flag in ["--tls", "-tls"] {
+        if let Some(stripped) = rest.strip_prefix(flag) {
+            tls = true;
+            rest = stripped.trim();
+            break;
+        }
+    }
+    if rest.is_empty() {
+        return None;
+    }
+
+    let default_port = if tls { 6697 } else { 6667 };
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(port) => (h.to_string(), port),
+            Err(_) => (rest.to_string(), default_port), // not "host:port" (e.g. bare IPv6) -- use as-is
+        },
+        None => (rest.to_string(), default_port),
+    };
+    Some((host, port, tls))
+}
+
+/// Connects to `host:port` (optionally over TLS) and relays every line the
+/// server sends back through `out_tx`. Also takes `cmd_rx`, a channel the UI
+/// can use to send raw lines out to the server (e.g. forwarding whatever the
+/// user types once connected). Runs until the connection closes or errors.
+fn spawn_connection(
+    host: String,
+    port: u16,
+    tls: bool,
+    out_tx: mpsc::UnboundedSender<String>,
+    mut cmd_rx: mpsc::UnboundedReceiver<String>,
+) {
     tokio::spawn(async move {
-        let stream = match TcpStream::connect(&target).await {
+        let addr = format!("{host}:{port}");
+        let tcp = match TcpStream::connect(&addr).await {
             Ok(s) => s,
             Err(e) => {
-                let _ = out_tx.send(format!("* Connection to {target} failed: {e}"));
+                let _ = out_tx.send(format!("* Connection to {addr} failed: {e}"));
                 return;
             }
         };
-        let _ = out_tx.send(format!("* Connected to {target}"));
 
-        let (reader, mut writer) = stream.into_split();
+        // Box the stream behind the shared trait so the rest of this
+        // function doesn't care whether TLS is in play.
+        let stream: Box<dyn AsyncStream> = if tls {
+            match upgrade_to_tls(&host, tcp).await {
+                Ok(s) => Box::new(s),
+                Err(e) => {
+                    let _ = out_tx.send(format!("* TLS handshake with {addr} failed: {e}"));
+                    return;
+                }
+            }
+        } else {
+            Box::new(tcp)
+        };
+
+        let scheme = if tls { "TLS" } else { "plaintext" };
+        let _ = out_tx.send(format!("* Connected to {addr} ({scheme})"));
+
+        let (reader, mut writer) = split(stream);
         let mut lines = BufReader::new(reader).lines();
 
         // Minimal registration so the server actually talks back with
@@ -360,11 +442,11 @@ fn spawn_connection(target: String, out_tx: mpsc::UnboundedSender<String>, mut c
                             }
                         }
                         Ok(None) => {
-                            let _ = out_tx.send(format!("* Disconnected from {target}"));
+                            let _ = out_tx.send(format!("* Disconnected from {addr}"));
                             break;
                         }
                         Err(e) => {
-                            let _ = out_tx.send(format!("* Read error from {target}: {e}"));
+                            let _ = out_tx.send(format!("* Read error from {addr}: {e}"));
                             break;
                         }
                     }
@@ -464,9 +546,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut Ap
     }
 }
 
-/// Handles one submitted input line: `/connect <host[:port]>` starts a new
-/// connection; anything else is sent raw to the active connection if there
-/// is one, or just echoed locally as a harmless fallback.
+/// Handles one submitted input line: `/connect [--tls] <host[:port]>` starts
+/// a new connection; anything else is sent raw to the active connection if
+/// there is one, or just echoed locally as a harmless fallback.
 fn handle_submitted_line(
     app: &mut App,
     msg: String,
@@ -474,16 +556,15 @@ fn handle_submitted_line(
     outgoing_tx: &mut Option<mpsc::UnboundedSender<String>>,
 ) {
     if let Some(rest) = msg.strip_prefix("/connect") {
-        let arg = rest.trim();
-        if arg.is_empty() {
-            app.push_output("Usage: /connect <host[:port]>".to_string());
+        let Some((host, port, tls)) = parse_connect_args(rest) else {
+            app.push_output("Usage: /connect [--tls] <host[:port]>".to_string());
             return;
-        }
-        let target = parse_connect_target(arg);
-        app.push_output(format!("* Connecting to {target}..."));
+        };
+        let scheme = if tls { "TLS" } else { "plaintext" };
+        app.push_output(format!("* Connecting to {host}:{port} ({scheme})..."));
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<String>();
         *outgoing_tx = Some(cmd_tx);
-        spawn_connection(target, net_tx.clone(), cmd_rx);
+        spawn_connection(host, port, tls, net_tx.clone(), cmd_rx);
         return;
     }
 

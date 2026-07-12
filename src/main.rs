@@ -2,7 +2,7 @@ use std::io::{self, Stdout};
 use std::sync::{Arc, OnceLock};
 
 use crossterm::{
-    event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers},
+    event::{DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -108,6 +108,19 @@ impl App {
     fn insert_char(&mut self, c: char) {
         self.input.insert(self.input_cursor, c);
         self.input_cursor += 1;
+    }
+
+    /// Inserts a whole string at the cursor in one go -- used for pastes.
+    /// A single `splice` shifts the tail once, versus `insert_char` in a
+    /// loop which would re-shift it on every character (O(n) per char,
+    /// O(n*m) overall for an m-character paste). Since the input is a
+    /// single-line field, newlines in the pasted text are dropped rather
+    /// than embedded.
+    fn insert_str(&mut self, s: &str) {
+        let chars: Vec<char> = s.chars().filter(|&c| c != '\n' && c != '\r').collect();
+        let inserted = chars.len();
+        self.input.splice(self.input_cursor..self.input_cursor, chars);
+        self.input_cursor += inserted;
     }
 
     fn backspace(&mut self) {
@@ -468,7 +481,7 @@ fn spawn_connection(
 async fn main() -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -477,7 +490,7 @@ async fn main() -> io::Result<()> {
 
     // Always restore the terminal, even if run_app returned an error.
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
     terminal.show_cursor()?;
 
     if let Err(e) = result {
@@ -526,6 +539,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut Ap
                             KeyCode::PageDown => app.page_down(),
                             _ => {}
                         }
+                    }
+                    // With bracketed paste enabled, a pasted block arrives
+                    // as one event and is inserted in a single splice --
+                    // this is what makes paste fast instead of trickling in
+                    // as hundreds of individual key events each triggering
+                    // their own redraw.
+                    Some(Ok(Event::Paste(text))) => {
+                        app.insert_str(&text);
                     }
                     // Resize needs no explicit handling: the next terminal.draw()
                     // re-measures the output/input areas and the clamp_* methods

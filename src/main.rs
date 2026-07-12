@@ -18,7 +18,14 @@ use ratatui::{
 /// Holds all mutable application state.
 struct App {
     output: Vec<String>,
-    input: String,
+    /// Input text stored as chars (not a String) so cursor movement and
+    /// insertion at arbitrary positions don't have to worry about UTF-8
+    /// byte-boundary slicing.
+    input: Vec<char>,
+    /// Cursor position as a char index into `input`, in `0..=input.len()`.
+    input_cursor: usize,
+    /// Number of chars scrolled off the left edge of the input line.
+    input_scroll: usize,
     /// Number of lines scrolled down from the top of `output`.
     scroll: usize,
     /// When true, the view auto-follows new output (sticks to the bottom).
@@ -39,7 +46,9 @@ impl App {
         ];
         Self {
             output,
-            input: String::new(),
+            input: Vec::new(),
+            input_cursor: 0,
+            input_scroll: 0,
             scroll: 0,
             follow_bottom: true,
             last_output_height: 0,
@@ -80,6 +89,73 @@ impl App {
         let max = self.max_scroll();
         self.scroll = (self.scroll + page).min(max);
         self.follow_bottom = self.scroll >= max;
+    }
+
+    fn insert_char(&mut self, c: char) {
+        self.input.insert(self.input_cursor, c);
+        self.input_cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.input_cursor > 0 {
+            self.input_cursor -= 1;
+            self.input.remove(self.input_cursor);
+        }
+    }
+
+    fn delete_forward(&mut self) {
+        if self.input_cursor < self.input.len() {
+            self.input.remove(self.input_cursor);
+        }
+    }
+
+    fn move_left(&mut self) {
+        self.input_cursor = self.input_cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.input_cursor = (self.input_cursor + 1).min(self.input.len());
+    }
+
+    fn move_home(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.input_cursor = self.input.len();
+    }
+
+    fn submit_input(&mut self) -> Option<String> {
+        if self.input.is_empty() {
+            return None;
+        }
+        let msg: String = std::mem::take(&mut self.input).into_iter().collect();
+        self.input_cursor = 0;
+        self.input_scroll = 0;
+        Some(msg)
+    }
+
+    /// Keep the cursor within the visible window of the input line, scrolling
+    /// horizontally like a text field when the content is wider than `width`.
+    /// Called every draw with the current line width, so it self-corrects on
+    /// resize just like the output area's vertical scroll does.
+    fn clamp_input_scroll(&mut self, width: usize) {
+        let width = width.max(1);
+        if self.input_cursor < self.input_scroll {
+            // Cursor moved left past the visible window -- scroll left to it.
+            self.input_scroll = self.input_cursor;
+        } else if self.input_cursor >= self.input_scroll + width {
+            // Cursor moved right past the visible window -- scroll right so
+            // the cursor lands on the last visible column.
+            self.input_scroll = self.input_cursor + 1 - width;
+        }
+        // If the line got shorter (deletion) or the window got wider
+        // (resize), don't leave a scroll position with unnecessary blank
+        // space trailing past the end of the text.
+        let max_scroll = self.input.len().saturating_sub(width);
+        if self.input_scroll > max_scroll {
+            self.input_scroll = max_scroll;
+        }
     }
 }
 
@@ -127,17 +203,17 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> 
                             return Ok(())
                         }
                         KeyCode::Enter => {
-                            if !app.input.is_empty() {
-                                let msg = std::mem::take(&mut app.input);
+                            if let Some(msg) = app.submit_input() {
                                 app.push_output(format!("> {msg}"));
                             }
                         }
-                        KeyCode::Backspace => {
-                            app.input.pop();
-                        }
-                        KeyCode::Char(c) => {
-                            app.input.push(c);
-                        }
+                        KeyCode::Backspace => app.backspace(),
+                        KeyCode::Delete => app.delete_forward(),
+                        KeyCode::Left => app.move_left(),
+                        KeyCode::Right => app.move_right(),
+                        KeyCode::Home => app.move_home(),
+                        KeyCode::End => app.move_end(),
+                        KeyCode::Char(c) => app.insert_char(c),
                         KeyCode::PageUp => app.page_up(),
                         KeyCode::PageDown => app.page_down(),
                         _ => {}
@@ -196,14 +272,30 @@ fn draw_status_bar(f: &mut Frame<'_>, area: Rect) {
     f.render_widget(status, area);
 }
 
-fn draw_input(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_input(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     // Prefix so it's visually distinguishable from the output area.
-    let text = format!("> {}", app.input);
-    let paragraph = Paragraph::new(text.as_str());
+    const PREFIX: &str = "> ";
+    let prefix_len = PREFIX.len() as u16;
+    let avail_width = area.width.saturating_sub(prefix_len) as usize;
+
+    // Re-clamp every draw (not just on keypress) so a terminal resize
+    // immediately reflows which slice of the input is visible.
+    app.clamp_input_scroll(avail_width);
+
+    let visible: String = app
+        .input
+        .iter()
+        .skip(app.input_scroll)
+        .take(avail_width)
+        .collect();
+    let text = format!("{PREFIX}{visible}");
+
+    let paragraph = Paragraph::new(text);
     f.render_widget(paragraph, area);
 
-    // Keep the terminal cursor visually parked at the end of typed input.
-    let cursor_x = area.x + 2 + app.input.len() as u16;
+    // Cursor column is relative to the scrolled window, not the full input.
+    let cursor_col = (app.input_cursor - app.input_scroll) as u16;
+    let cursor_x = area.x + prefix_len + cursor_col;
     let cursor_y = area.y;
     f.set_cursor_position((cursor_x, cursor_y));
 }

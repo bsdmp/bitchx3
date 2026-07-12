@@ -25,6 +25,9 @@ use tokio_rustls::{
     TlsConnector,
 };
 
+mod commands;
+use commands::{parse_script, CommandHost, Interpreter};
+
 /// Holds all mutable application state.
 struct App {
     output: Vec<String>,
@@ -57,6 +60,7 @@ impl App {
             "Welcome! Type a message and press Enter to submit.".to_string(),
             "Use PageUp / PageDown to scroll this output area.".to_string(),
             "Try /connect irc.libera.chat:6667, or /connect --tls irc.libera.chat:6697.".to_string(),
+            "Also: /alias name { ...commands... }, /if $1 == foo { ... }, /load <file>.".to_string(),
         ];
         Self {
             output,
@@ -505,6 +509,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut Ap
     let (net_tx, mut net_rx) = mpsc::unbounded_channel::<String>();
     // Outgoing raw lines to the *currently* active connection, if any.
     let mut outgoing_tx: Option<mpsc::UnboundedSender<String>> = None;
+    // Owns user-defined aliases; persists for the whole session so aliases
+    // defined earlier are still available later.
+    let mut interpreter = Interpreter::new();
 
     let mut events = EventStream::new();
 
@@ -525,7 +532,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut Ap
                             }
                             KeyCode::Enter => {
                                 if let Some(msg) = app.submit_input() {
-                                    handle_submitted_line(app, msg, &net_tx, &mut outgoing_tx);
+                                    handle_submitted_line(app, msg, &net_tx, &mut outgoing_tx, &mut interpreter);
                                 }
                             }
                             KeyCode::Backspace => app.backspace(),
@@ -563,25 +570,26 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut Ap
     }
 }
 
-/// Handles one submitted input line: `/connect [--tls] <host[:port]>` starts
-/// a new connection; anything else is sent raw to the active connection if
-/// there is one, or just echoed locally as a harmless fallback.
+/// Handles one submitted input line. Anything starting with `/` is parsed
+/// and run as a script statement (`connect`, `alias`, `if`, `load`, a
+/// user-defined alias, ...); anything else is sent raw to the active
+/// connection if there is one, or just echoed locally as a harmless
+/// fallback -- ordinary chat text, not a command.
 fn handle_submitted_line(
     app: &mut App,
     msg: String,
     net_tx: &mpsc::UnboundedSender<String>,
     outgoing_tx: &mut Option<mpsc::UnboundedSender<String>>,
+    interpreter: &mut Interpreter,
 ) {
-    if let Some(rest) = msg.strip_prefix("/connect") {
-        let Some((host, port, tls)) = parse_connect_args(rest) else {
-            app.push_output("Usage: /connect [--tls] <host[:port]>".to_string());
-            return;
-        };
-        let scheme = if tls { "TLS" } else { "plaintext" };
-        app.push_output(format!("* Connecting to {host}:{port} ({scheme})..."));
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<String>();
-        *outgoing_tx = Some(cmd_tx);
-        spawn_connection(host, port, tls, net_tx.clone(), cmd_rx);
+    if let Some(rest) = msg.strip_prefix('/') {
+        match parse_script(rest) {
+            Ok(stmts) => {
+                let mut host = Host { app, net_tx, outgoing_tx };
+                interpreter.exec(&stmts, &[], &mut host);
+            }
+            Err(e) => app.push_output(format!("! parse error: {e}")),
+        }
         return;
     }
 
@@ -590,6 +598,73 @@ fn handle_submitted_line(
             let _ = tx.send(msg);
         }
         None => app.push_output(format!("> {msg}")),
+    }
+}
+
+/// Bridges the generic [`Interpreter`] to this app's concrete state: output,
+/// the network channel used to start new connections, and the outgoing
+/// channel to whichever connection is currently active.
+struct Host<'a> {
+    app: &'a mut App,
+    net_tx: &'a mpsc::UnboundedSender<String>,
+    outgoing_tx: &'a mut Option<mpsc::UnboundedSender<String>>,
+}
+
+impl Host<'_> {
+    /// Sends a raw line to the active connection, or reports that there
+    /// isn't one.
+    fn send_line(&mut self, line: String) {
+        match self.outgoing_tx {
+            Some(tx) => {
+                let _ = tx.send(line);
+            }
+            None => self.app.push_output("Not connected.".to_string()),
+        }
+    }
+}
+
+impl CommandHost for Host<'_> {
+    fn run_command(&mut self, name: &str, args: &[String]) {
+        match name {
+            "echo" => self.app.push_output(args.join(" ")),
+            "connect" => match parse_connect_args(&args.join(" ")) {
+                Some((host, port, tls)) => {
+                    let scheme = if tls { "TLS" } else { "plaintext" };
+                    self.app.push_output(format!("* Connecting to {host}:{port} ({scheme})..."));
+                    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<String>();
+                    *self.outgoing_tx = Some(cmd_tx);
+                    spawn_connection(host, port, tls, self.net_tx.clone(), cmd_rx);
+                }
+                None => self.app.push_output("Usage: connect [--tls] <host[:port]>".to_string()),
+            },
+            "msg" => {
+                if args.len() < 2 {
+                    self.app.push_output("Usage: msg <target> <text...>".to_string());
+                    return;
+                }
+                let target = &args[0];
+                let text = args[1..].join(" ");
+                self.send_line(format!("PRIVMSG {target} :{text}"));
+            }
+            "raw" => {
+                if args.is_empty() {
+                    self.app.push_output("Usage: raw <irc line...>".to_string());
+                    return;
+                }
+                self.send_line(args.join(" "));
+            }
+            other => self.app.push_output(format!("Unknown command: {other}")),
+        }
+    }
+
+    fn read_script_file(&mut self, path: &str) -> Result<String, String> {
+        // A small, synchronous read -- scripts are local and tiny, so
+        // briefly blocking the async runtime here isn't a concern.
+        std::fs::read_to_string(path).map_err(|e| e.to_string())
+    }
+
+    fn report_error(&mut self, message: &str) {
+        self.app.push_output(format!("! {message}"));
     }
 }
 

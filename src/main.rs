@@ -35,6 +35,10 @@ struct App {
     follow_bottom: bool,
     /// Height (in lines) of the output area, refreshed every draw call.
     last_output_height: usize,
+    /// Number of *wrapped* lines the output currently renders to, refreshed
+    /// every draw call. Scroll math is done against this, not `output.len()`,
+    /// since word-wrapping can turn one raw line into several rendered ones.
+    last_wrapped_len: usize,
 }
 
 impl App {
@@ -52,11 +56,12 @@ impl App {
             scroll: 0,
             follow_bottom: true,
             last_output_height: 0,
+            last_wrapped_len: 0,
         }
     }
 
     fn max_scroll(&self) -> usize {
-        self.output.len().saturating_sub(self.last_output_height.max(1))
+        self.last_wrapped_len.saturating_sub(self.last_output_height.max(1))
     }
 
     /// Re-validate `scroll` against the current output height. Call this
@@ -73,9 +78,8 @@ impl App {
 
     fn push_output(&mut self, line: String) {
         self.output.push(line);
-        if self.follow_bottom {
-            self.scroll = self.max_scroll();
-        }
+        // Scroll position is re-derived from the fresh wrapped-line count on
+        // the next draw call (see clamp_scroll), so nothing to do here.
     }
 
     fn page_up(&mut self) {
@@ -159,6 +163,54 @@ impl App {
     }
 }
 
+/// Wraps a single line of text to `width` columns, breaking on word (space)
+/// boundaries where possible. A single word longer than `width` is hard-broken
+/// mid-word since there's no boundary to break on. Always returns at least one
+/// (possibly empty) line.
+fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut result = Vec::new();
+    let mut current = String::new();
+
+    for word in line.split(' ') {
+        wrap_word(&mut result, &mut current, word, width);
+    }
+    result.push(current);
+    result
+}
+
+fn wrap_word(result: &mut Vec<String>, current: &mut String, word: &str, width: usize) {
+    let word_len = word.chars().count();
+
+    // Word alone doesn't fit on any line -- hard-break it by characters.
+    if word_len > width {
+        if !current.is_empty() {
+            result.push(std::mem::take(current));
+        }
+        let mut chunk = String::new();
+        for ch in word.chars() {
+            if chunk.chars().count() == width {
+                result.push(std::mem::take(&mut chunk));
+            }
+            chunk.push(ch);
+        }
+        *current = chunk; // leftover partial chunk continues accumulating
+        return;
+    }
+
+    let needs_space = !current.is_empty();
+    let extra = if needs_space { 1 } else { 0 };
+    if current.chars().count() + extra + word_len > width {
+        result.push(std::mem::take(current));
+    } else if needs_space {
+        current.push(' ');
+    }
+    current.push_str(word);
+}
 fn main() -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -245,15 +297,24 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
 }
 
 fn draw_output(f: &mut Frame<'_>, app: &mut App, area: Rect) {
-    // No border now, so the full area height is the visible line count.
-    let inner_height = area.height as usize;
+    // No border, so the full area is the visible line/column budget.
+    let width = area.width as usize;
+    let height = area.height as usize;
 
-    // Update the known height *before* clamping, so a resize is honored
-    // on this very frame rather than lagging a keypress behind.
-    app.last_output_height = inner_height;
+    // Re-wrap every draw against the current width -- this is what makes a
+    // resize (which changes wrapping, not just visible line count) come out
+    // correct: the wrapped total is recomputed fresh each frame.
+    let wrapped: Vec<String> = app
+        .output
+        .iter()
+        .flat_map(|line| wrap_line(line, width))
+        .collect();
+
+    app.last_output_height = height;
+    app.last_wrapped_len = wrapped.len();
     app.clamp_scroll();
 
-    let lines: Vec<Line> = app.output.iter().map(|s| Line::from(Span::raw(s.clone()))).collect();
+    let lines: Vec<Line> = wrapped.into_iter().map(|s| Line::from(Span::raw(s))).collect();
 
     let paragraph = Paragraph::new(lines).scroll((app.scroll as u16, 0));
 

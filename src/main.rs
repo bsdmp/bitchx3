@@ -584,11 +584,19 @@ fn handle_submitted_line(
 ) {
     if let Some(rest) = msg.strip_prefix('/') {
         match parse_script(rest) {
-            Ok(stmts) => {
+            Ok(script) => {
                 let mut host = Host { app, net_tx, outgoing_tx };
-                interpreter.exec(&stmts, &[], &mut host);
+                interpreter.exec(&script, &[], &mut host);
             }
-            Err(e) => app.push_output(format!("! parse error: {e}")),
+            Err(e) => {
+                // pest's error message is itself multi-line (source
+                // excerpt + a caret pointing at the problem) -- keep that
+                // formatting intact rather than squashing it onto one line.
+                app.push_output("! parse error:".to_string());
+                for line in e.lines() {
+                    app.push_output(line.to_string());
+                }
+            }
         }
         return;
     }

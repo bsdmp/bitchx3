@@ -1,0 +1,55 @@
+// Grammar for the chat scripting language (see commands.rs for the
+// interpreter). Kept declarative on purpose: adding a new precedence tier
+// (e.g. unary `!`) or a new statement kind is a matter of adding a rule
+// here plus a matching arm in commands.rs, not restructuring a hand-written
+// recursive-descent parser.
+
+WHITESPACE = _{ " " | "\t" }
+COMMENT    = _{ "#" ~ (!NEWLINE ~ ANY)* }
+
+// Statement separators: real newlines or `;`. Silent -- they don't need
+// their own AST nodes, just to delimit statements.
+terminator = _{ NEWLINE | ";" }
+
+// A whole script: one input line, or a whole loaded file.
+script = { SOI ~ terminator* ~ (statement ~ terminator+)* ~ statement? ~ EOI }
+
+// A `{ ... }` block is just a nested script.
+block = { "{" ~ terminator* ~ (statement ~ terminator+)* ~ statement? ~ terminator* ~ "}" }
+
+statement = { if_stmt | generic_stmt }
+
+// "if" is a real keyword, not just another command name, since its
+// argument is a whole expression grammar rather than a flat word list.
+// The negative lookahead keeps it from matching a command literally named
+// "ifsomething".
+if_stmt = { ^"if" ~ !(ASCII_ALPHANUMERIC | "_") ~ expr ~ block }
+
+// Every other command: `name arg* block?`. `alias`/`load`/user aliases are
+// all just generic_stmt as far as the grammar is concerned -- what they
+// mean is decided by the interpreter, not the parser.
+generic_stmt = { name ~ arg* ~ block? }
+
+name = @{ token_char+ }
+arg  = @{ quoted_string | token_char+ }
+
+// A bare (unquoted) run of characters, stopping at whitespace, a statement
+// terminator, braces, or a quote.
+token_char = @{ !(" " | "\t" | NEWLINE | ";" | "{" | "}" | "\"") ~ ANY }
+
+quoted_string = @{ "\"" ~ (escape | (!("\"" | "\\") ~ ANY))* ~ "\"" }
+escape        = @{ "\\" ~ ANY }
+
+// Expression grammar, precedence low-to-high: or, and, comparison.
+// Each tier is left-associative, built by chaining at that level.
+expr     = { or_expr }
+or_expr  = { and_expr ~ (or_op ~ and_expr)* }
+and_expr = { cmp_expr ~ (and_op ~ cmp_expr)* }
+cmp_expr = { atom ~ (cmp_op ~ atom)? }
+atom     = @{ quoted_string | token_char+ }
+
+or_op  = { "||" }
+and_op = { "&&" }
+// Order matters: longer operators must be tried before their prefixes
+// (e.g. "<=" before "<") or the parser would stop one character short.
+cmp_op = { "==" | "!=" | "<=" | ">=" | "<" | ">" }

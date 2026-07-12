@@ -1,11 +1,11 @@
 use std::io::{self, Stdout};
-use std::time::Duration;
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use futures::StreamExt;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -13,6 +13,11 @@ use ratatui::{
     text::{Line, Span},
     widgets::Paragraph,
     Frame, Terminal,
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
+    sync::mpsc,
 };
 
 /// Holds all mutable application state.
@@ -46,7 +51,7 @@ impl App {
         let output = vec![
             "Welcome! Type a message and press Enter to submit.".to_string(),
             "Use PageUp / PageDown to scroll this output area.".to_string(),
-            "Resize the terminal at any time -- scroll position is preserved.".to_string(),
+            "Try /connect irc.libera.chat:6667 to connect to an IRC server.".to_string(),
         ];
         Self {
             output,
@@ -220,7 +225,165 @@ fn wrap_word(result: &mut Vec<String>, current: &mut String, word: &str, width: 
     }
     current.push_str(word);
 }
-fn main() -> io::Result<()> {
+
+// ---------------------------------------------------------------------------
+// IRC support
+// ---------------------------------------------------------------------------
+
+/// A minimally-parsed IRC line: `[:prefix] COMMAND [params...] [:trailing]`.
+/// `params` holds middle params followed by the trailing param (if any) as a
+/// single last element, matching how most IRC messages are consumed.
+struct IrcMessage {
+    prefix: Option<String>,
+    command: String,
+    params: Vec<String>,
+}
+
+/// Parses one raw IRC protocol line (no trailing CR/LF) into its parts.
+/// This is deliberately minimal -- just enough structure to strip numerics
+/// and to spot PING -- not a full IRCv3 parser.
+fn parse_irc_line(line: &str) -> IrcMessage {
+    let mut rest = line;
+    let mut prefix = None;
+
+    if let Some(stripped) = rest.strip_prefix(':') {
+        match stripped.find(' ') {
+            Some(idx) => {
+                prefix = Some(stripped[..idx].to_string());
+                rest = &stripped[idx + 1..];
+            }
+            None => {
+                prefix = Some(stripped.to_string());
+                rest = "";
+            }
+        }
+    }
+
+    let mut params = Vec::new();
+    let command;
+    if let Some(idx) = rest.find(" :") {
+        let (head, trailing) = rest.split_at(idx);
+        let trailing = &trailing[2..]; // skip over " :"
+        let mut parts = head.split_whitespace();
+        command = parts.next().unwrap_or("").to_string();
+        params.extend(parts.map(str::to_string));
+        params.push(trailing.to_string());
+    } else {
+        let mut parts = rest.split_whitespace();
+        command = parts.next().unwrap_or("").to_string();
+        params.extend(parts.map(str::to_string));
+    }
+
+    IrcMessage { prefix, command, params }
+}
+
+/// Extension point for future per-numeric handling (e.g. tracking the
+/// nickname the server confirmed in 001, populating a channel list from
+/// 353, etc). Currently a no-op -- wire up a registry here (for example a
+/// `HashMap<u16, Vec<Box<dyn Fn(&IrcMessage)>>>` on `App`) when that's needed.
+fn dispatch_numeric(_code: u16, _msg: &IrcMessage) {}
+
+/// Formats a raw IRC line for display in the output area. Numeric replies
+/// (e.g. `001`, `353`, `376`) are routed through `dispatch_numeric` and then
+/// stripped from the visible text -- the sender and message body still show,
+/// just without the noisy 3-digit code.
+fn format_irc_line(raw: &str) -> String {
+    let msg = parse_irc_line(raw);
+
+    let is_numeric = msg.command.len() == 3 && msg.command.bytes().all(|b| b.is_ascii_digit());
+    if is_numeric {
+        if let Ok(code) = msg.command.parse::<u16>() {
+            dispatch_numeric(code, &msg);
+        }
+    }
+
+    let mut out = String::new();
+    if let Some(prefix) = &msg.prefix {
+        out.push_str(prefix);
+        out.push(' ');
+    }
+    if !is_numeric {
+        out.push_str(&msg.command);
+        out.push(' ');
+    }
+    out.push_str(&msg.params.join(" "));
+    out.trim().to_string()
+}
+
+/// Turns a user-typed `/connect` argument into a `host:port` string,
+/// defaulting to IRC's traditional plaintext port when none is given.
+fn parse_connect_target(arg: &str) -> String {
+    if arg.contains(':') {
+        arg.to_string()
+    } else {
+        format!("{arg}:6667")
+    }
+}
+
+/// Connects to `target` and relays every line the server sends back through
+/// `out_tx`. Also takes `cmd_rx`, a channel the UI can use to send raw lines
+/// out to the server (e.g. forwarding whatever the user types once
+/// connected). Runs until the connection closes or errors.
+fn spawn_connection(target: String, out_tx: mpsc::UnboundedSender<String>, mut cmd_rx: mpsc::UnboundedReceiver<String>) {
+    tokio::spawn(async move {
+        let stream = match TcpStream::connect(&target).await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = out_tx.send(format!("* Connection to {target} failed: {e}"));
+                return;
+            }
+        };
+        let _ = out_tx.send(format!("* Connected to {target}"));
+
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        // Minimal registration so the server actually talks back with
+        // numerics instead of just waiting on us.
+        let _ = writer.write_all(b"NICK tui_user\r\n").await;
+        let _ = writer.write_all(b"USER tui_user 0 * :Rust TUI IRC client\r\n").await;
+
+        loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    match line {
+                        Ok(Some(raw)) => {
+                            // Keepalive: servers periodically send PING and
+                            // will disconnect us if we don't PONG back.
+                            let parsed = parse_irc_line(&raw);
+                            if parsed.command.eq_ignore_ascii_case("PING") {
+                                let token = parsed.params.last().cloned().unwrap_or_default();
+                                let _ = writer.write_all(format!("PONG :{token}\r\n").as_bytes()).await;
+                            }
+                            if out_tx.send(raw).is_err() {
+                                break; // UI side went away
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = out_tx.send(format!("* Disconnected from {target}"));
+                            break;
+                        }
+                        Err(e) => {
+                            let _ = out_tx.send(format!("* Read error from {target}: {e}"));
+                            break;
+                        }
+                    }
+                }
+                Some(cmd) = cmd_rx.recv() => {
+                    let _ = writer.write_all(cmd.as_bytes()).await;
+                    let _ = writer.write_all(b"\r\n").await;
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// App wiring
+// ---------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -228,7 +391,7 @@ fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new();
-    let result = run_app(&mut terminal, &mut app);
+    let result = run_app(&mut terminal, &mut app).await;
 
     // Always restore the terminal, even if run_app returned an error.
     disable_raw_mode()?;
@@ -245,48 +408,90 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
+async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
+    // Incoming lines from whichever IRC connection is currently active (and
+    // any that came before it) all flow through this single channel.
+    let (net_tx, mut net_rx) = mpsc::unbounded_channel::<String>();
+    // Outgoing raw lines to the *currently* active connection, if any.
+    let mut outgoing_tx: Option<mpsc::UnboundedSender<String>> = None;
+
+    let mut events = EventStream::new();
+
     loop {
         terminal.draw(|f| ui(f, app))?;
 
-        // Poll with a timeout so the UI stays responsive even with no input,
-        // and so resize events (which crossterm delivers between reads) get
-        // picked up promptly.
-        if event::poll(Duration::from_millis(200))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
-                    }
-                    match key.code {
-                        KeyCode::Esc => return Ok(()),
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Ok(())
+        tokio::select! {
+            maybe_event = events.next() => {
+                match maybe_event {
+                    Some(Ok(Event::Key(key))) => {
+                        if key.kind != KeyEventKind::Press {
+                            continue;
                         }
-                        KeyCode::Enter => {
-                            if let Some(msg) = app.submit_input() {
-                                app.push_output(format!("> {msg}"));
+                        match key.code {
+                            KeyCode::Esc => return Ok(()),
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                return Ok(())
                             }
+                            KeyCode::Enter => {
+                                if let Some(msg) = app.submit_input() {
+                                    handle_submitted_line(app, msg, &net_tx, &mut outgoing_tx);
+                                }
+                            }
+                            KeyCode::Backspace => app.backspace(),
+                            KeyCode::Delete => app.delete_forward(),
+                            KeyCode::Left => app.move_left(),
+                            KeyCode::Right => app.move_right(),
+                            KeyCode::Home => app.move_home(),
+                            KeyCode::End => app.move_end(),
+                            KeyCode::Char(c) => app.insert_char(c),
+                            KeyCode::PageUp => app.page_up(),
+                            KeyCode::PageDown => app.page_down(),
+                            _ => {}
                         }
-                        KeyCode::Backspace => app.backspace(),
-                        KeyCode::Delete => app.delete_forward(),
-                        KeyCode::Left => app.move_left(),
-                        KeyCode::Right => app.move_right(),
-                        KeyCode::Home => app.move_home(),
-                        KeyCode::End => app.move_end(),
-                        KeyCode::Char(c) => app.insert_char(c),
-                        KeyCode::PageUp => app.page_up(),
-                        KeyCode::PageDown => app.page_down(),
-                        _ => {}
                     }
+                    // Resize needs no explicit handling: the next terminal.draw()
+                    // re-measures the output/input areas and the clamp_* methods
+                    // adjust scroll positions to fit.
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => {}
+                    None => return Ok(()), // event stream closed
                 }
-                // No special handling needed here: the next terminal.draw()
-                // call naturally re-measures the output area and clamp_scroll()
-                // adjusts the scroll position to fit.
-                Event::Resize(_, _) => {}
-                _ => {}
+            }
+            Some(line) = net_rx.recv() => {
+                app.push_output(format_irc_line(&line));
             }
         }
+    }
+}
+
+/// Handles one submitted input line: `/connect <host[:port]>` starts a new
+/// connection; anything else is sent raw to the active connection if there
+/// is one, or just echoed locally as a harmless fallback.
+fn handle_submitted_line(
+    app: &mut App,
+    msg: String,
+    net_tx: &mpsc::UnboundedSender<String>,
+    outgoing_tx: &mut Option<mpsc::UnboundedSender<String>>,
+) {
+    if let Some(rest) = msg.strip_prefix("/connect") {
+        let arg = rest.trim();
+        if arg.is_empty() {
+            app.push_output("Usage: /connect <host[:port]>".to_string());
+            return;
+        }
+        let target = parse_connect_target(arg);
+        app.push_output(format!("* Connecting to {target}..."));
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<String>();
+        *outgoing_tx = Some(cmd_tx);
+        spawn_connection(target, net_tx.clone(), cmd_rx);
+        return;
+    }
+
+    match outgoing_tx {
+        Some(tx) => {
+            let _ = tx.send(msg);
+        }
+        None => app.push_output(format!("> {msg}")),
     }
 }
 

@@ -48,10 +48,10 @@ struct App {
     follow_bottom: bool,
     /// Height (in lines) of the output area, refreshed every draw call.
     last_output_height: usize,
-    /// Number of *wrapped* lines the output currently renders to, refreshed
-    /// every draw call. Scroll math is done against this, not `output.len()`,
-    /// since word-wrapping can turn one raw line into several rendered ones.
-    last_wrapped_len: usize,
+    /// Word-wrap results for `output`, kept incrementally so a redraw only
+    /// touches the raw lines actually visible instead of re-wrapping the
+    /// whole scrollback every frame. See [`WrapCache`].
+    wrap_cache: WrapCache,
 }
 
 impl App {
@@ -70,12 +70,12 @@ impl App {
             scroll: 0,
             follow_bottom: true,
             last_output_height: 0,
-            last_wrapped_len: 0,
+            wrap_cache: WrapCache::new(),
         }
     }
 
     fn max_scroll(&self) -> usize {
-        self.last_wrapped_len.saturating_sub(self.last_output_height.max(1))
+        self.wrap_cache.total().saturating_sub(self.last_output_height.max(1))
     }
 
     /// Re-validate `scroll` against the current output height. Call this
@@ -91,9 +91,14 @@ impl App {
     }
 
     fn push_output(&mut self, line: String) {
+        // Wrap just this one line and append -- cheap regardless of how
+        // long the scrollback already is. If the cache hasn't been built
+        // yet (no draw has happened), skip: the first draw's rebuild will
+        // cover this line along with everything else in one pass.
+        if self.wrap_cache.is_built() {
+            self.wrap_cache.push(&line);
+        }
         self.output.push(line);
-        // Scroll position is re-derived from the fresh wrapped-line count on
-        // the next draw call (see clamp_scroll), so nothing to do here.
     }
 
     fn page_up(&mut self) {
@@ -246,6 +251,97 @@ fn wrap_word(result: &mut Vec<String>, current: &mut String, word: &str, width: 
         current.push(' ');
     }
     current.push_str(word);
+}
+
+/// Caches word-wrapped output so a redraw only touches the raw lines that
+/// are actually visible, instead of re-wrapping the entire scrollback every
+/// frame. The expensive part -- wrapping every raw line -- only happens
+/// once per raw line (on `push`) or, when the width itself changes, once
+/// for the whole scrollback (on `rebuild`). Everything else is O(1)
+/// bookkeeping plus O(visible lines) work.
+struct WrapCache {
+    /// Width this cache was last built for. 0 means "not built yet".
+    width: u16,
+    /// Wrapped sub-lines per raw output line, same order as `App::output`.
+    wrapped: Vec<Vec<String>>,
+    /// Running total of wrapped-line counts: `prefix[i]` is how many
+    /// wrapped lines `output[0..i]` contributes in total, so it has one
+    /// more entry than `wrapped` (`prefix[wrapped.len()]` is the grand
+    /// total). This is what lets `visible_slice` jump straight to the raw
+    /// line containing a given scroll position via binary search, without
+    /// walking or re-wrapping anything before it.
+    prefix: Vec<usize>,
+}
+
+impl WrapCache {
+    fn new() -> Self {
+        Self { width: 0, wrapped: Vec::new(), prefix: vec![0] }
+    }
+
+    fn is_built(&self) -> bool {
+        self.width != 0
+    }
+
+    fn total(&self) -> usize {
+        *self.prefix.last().unwrap_or(&0)
+    }
+
+    /// Rebuilds the whole cache at `width`. O(size of scrollback) -- only
+    /// called when the width has actually changed (i.e. on a real resize),
+    /// since that's the only time existing wrap results become stale.
+    fn rebuild(&mut self, output: &[String], width: u16) {
+        self.width = width;
+        self.wrapped.clear();
+        self.prefix.clear();
+        self.prefix.push(0);
+        for line in output {
+            self.push_wrapped(wrap_line(line, width as usize));
+        }
+    }
+
+    /// Wraps and appends just one new raw line. O(length of that line) --
+    /// this is what keeps a redraw cheap when a new IRC line arrives or the
+    /// user hits Enter, no matter how long the scrollback already is.
+    fn push(&mut self, line: &str) {
+        let wrapped = wrap_line(line, self.width.max(1) as usize);
+        self.push_wrapped(wrapped);
+    }
+
+    fn push_wrapped(&mut self, wrapped: Vec<String>) {
+        let total = self.prefix.last().copied().unwrap_or(0) + wrapped.len();
+        self.wrapped.push(wrapped);
+        self.prefix.push(total);
+    }
+
+    /// Returns up to `height` wrapped lines starting at global wrapped-line
+    /// position `start`, touching only the raw lines that overlap that
+    /// range. Correctly resumes mid-way through a raw line's wrapped
+    /// output, which matters since scroll position isn't guaranteed to
+    /// land on a raw-line boundary (e.g. after a resize changes wrapping).
+    fn visible_slice(&self, start: usize, height: usize) -> Vec<String> {
+        if height == 0 || self.wrapped.is_empty() {
+            return Vec::new();
+        }
+        // Index of the raw line containing `start`: the last raw line
+        // whose starting offset (prefix[i]) is <= start.
+        let raw_idx = self.prefix.partition_point(|&p| p <= start).saturating_sub(1);
+
+        let mut out = Vec::with_capacity(height);
+        let mut offset_in_line = start.saturating_sub(self.prefix.get(raw_idx).copied().unwrap_or(0));
+        for line_wraps in &self.wrapped[raw_idx.min(self.wrapped.len())..] {
+            if out.len() >= height {
+                break;
+            }
+            for sub in line_wraps.iter().skip(offset_in_line) {
+                if out.len() >= height {
+                    break;
+                }
+                out.push(sub.clone());
+            }
+            offset_in_line = 0;
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -693,25 +789,26 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
 
 fn draw_output(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     // No border, so the full area is the visible line/column budget.
-    let width = area.width as usize;
     let height = area.height as usize;
 
-    // Re-wrap every draw against the current width -- this is what makes a
-    // resize (which changes wrapping, not just visible line count) come out
-    // correct: the wrapped total is recomputed fresh each frame.
-    let wrapped: Vec<String> = app
-        .output
-        .iter()
-        .flat_map(|line| wrap_line(line, width))
-        .collect();
+    // Only touch every raw line when the width has genuinely changed --
+    // that's the one case where previously-computed wraps are stale.
+    // Typing, incoming IRC lines, and plain scrolling never hit this path.
+    if app.wrap_cache.width != area.width {
+        app.wrap_cache.rebuild(&app.output, area.width);
+    }
 
     app.last_output_height = height;
-    app.last_wrapped_len = wrapped.len();
     app.clamp_scroll();
 
-    let lines: Vec<Line> = wrapped.into_iter().map(|s| Line::from(Span::raw(s))).collect();
+    // Only the lines that will actually be drawn are materialized here --
+    // O(viewport height), not O(scrollback size).
+    let visible = app.wrap_cache.visible_slice(app.scroll, height);
+    let lines: Vec<Line> = visible.into_iter().map(|s| Line::from(Span::raw(s))).collect();
 
-    let paragraph = Paragraph::new(lines).scroll((app.scroll as u16, 0));
+    // No .scroll() needed anymore: visible_slice already returned exactly
+    // the window that should appear, starting at row 0.
+    let paragraph = Paragraph::new(lines);
 
     f.render_widget(paragraph, area);
 }
